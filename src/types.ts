@@ -26,6 +26,7 @@ export interface PooledSession {
   browser: BrowserInstance;
   createdAt: number;
   useCount: number;
+  lastUsedAt: number;
 }
 
 /**
@@ -46,6 +47,9 @@ export interface PoolConfig {
   
   /** Maximum age of session in ms before recycling (default: 5 minutes) */
   maxAgeMs?: number;
+  
+  /** Maximum idle time in ms before recycling (default: 2 minutes) */
+  maxIdleMs?: number;
   
   /** Enable health check interval (default: false) */
   enableHealthCheck?: boolean;
