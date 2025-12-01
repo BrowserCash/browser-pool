@@ -5,8 +5,7 @@ Shared browser session pool for Browser.cash services.
 ## Installation
 
 ```bash
-# From another package in the monorepo
-npm install @browsercash/pool@file:../browsercash-pool
+npm install @browsercash/pool@git+https://github.com/Mega-Tera/browser-pool.git
 ```
 
 ## Usage
