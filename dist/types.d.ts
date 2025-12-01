@@ -25,6 +25,10 @@ export interface PooledSession {
     createdAt: number;
     useCount: number;
     lastUsedAt: number;
+    /** Optional: BrowserContext created for this session (if available) */
+    context?: any;
+    /** Optional: Pre-created Page for this session when enabled via config */
+    page?: any;
 }
 /**
  * Pool configuration options
@@ -50,6 +54,8 @@ export interface PoolConfig {
     enableWaitQueue?: boolean;
     /** Enable CDP disconnect event handling (default: true) */
     enableDisconnectHandling?: boolean;
+    /** When true, pre-create a browser Page for each session and expose it on the pooled session (default: false) */
+    createPage?: boolean;
     /** Enable debug logging (default: false) */
     debug?: boolean;
     /** Custom logger function */

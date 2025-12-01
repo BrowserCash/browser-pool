@@ -33,6 +33,7 @@ export class SessionPool {
   private readonly healthCheckIntervalMs: number;
   private readonly enableWaitQueue: boolean;
   private readonly enableDisconnectHandling: boolean;
+  private readonly createPage: boolean;
   private readonly debug: boolean;
   private readonly logger: (message: string, data?: Record<string, any>) => void;
 
@@ -47,6 +48,7 @@ export class SessionPool {
     this.healthCheckIntervalMs = config.healthCheckIntervalMs ?? 30_000;
     this.enableWaitQueue = config.enableWaitQueue ?? true;
     this.enableDisconnectHandling = config.enableDisconnectHandling ?? true;
+    this.createPage = config.createPage ?? false;
     this.debug = config.debug ?? false;
     this.logger = config.logger ?? ((msg, data) => {
       if (data) {
@@ -106,11 +108,20 @@ export class SessionPool {
   }
 
   private performHealthCheck(): void {
-    this.log("[pool] health check", { ...this.stats() });
-
     const toReplace: PooledSession[] = [];
     for (const session of this.available) {
       if (!this.isUsable(session)) toReplace.push(session);
+    }
+
+    const deficit = this.size - this.totalCount;
+    
+    // Only log if there are issues (sessions to replace or pool is below capacity)
+    if (toReplace.length > 0 || deficit > 0) {
+      this.log("[pool] health check: issues found", { 
+        toReplace: toReplace.length, 
+        deficit,
+        ...this.stats() 
+      });
     }
 
     // Replace each unusable session: create new one first, then remove old
@@ -233,11 +244,21 @@ export class SessionPool {
       throw err;
     }
     
-    // Pre-create context so parallel scrapes don't race on context creation
-    if (typeof browser.contexts === "function" && browser.contexts().length === 0) {
-      if (typeof browser.newContext === "function") {
-        await browser.newContext();
+    // Ensure a context exists so parallel work doesn't race on first context creation
+    let context: any | undefined;
+    if (typeof browser.contexts === "function") {
+      const contexts = browser.contexts();
+      if (Array.isArray(contexts) && contexts.length > 0) {
+        context = contexts[0];
+      } else if (typeof browser.newContext === "function") {
+        context = await browser.newContext();
       }
+    }
+
+    // Optionally create a Page for consumers that want a ready-to-use tab
+    let page: any | undefined;
+    if (this.createPage && context && typeof context.newPage === "function") {
+      page = await context.newPage();
     }
 
     const now = Date.now();
@@ -248,6 +269,8 @@ export class SessionPool {
       createdAt: now,
       useCount: 0,
       lastUsedAt: now,
+      context,
+      page,
     };
   }
 

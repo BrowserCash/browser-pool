@@ -21,6 +21,7 @@ export declare class SessionPool {
     private readonly healthCheckIntervalMs;
     private readonly enableWaitQueue;
     private readonly enableDisconnectHandling;
+    private readonly createPage;
     private readonly debug;
     private readonly logger;
     constructor(config: PoolConfig);
