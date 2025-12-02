@@ -1,64 +1,132 @@
-# @browsercash/pool
+<div align="center">
+  <h1>🌊 Browser Pool</h1>
+  <p>
+    <strong>Robust browser session management for Playwright & Browser.cash.</strong>
+  </p>
+  <p>
+    Powered by <a href="https://browser.cash/developers">Browser.cash</a> remote browsers.
+  </p>
 
-Shared browser session pool for Browser.cash services.
+  <p>
+    <a href="#-features">Features</a> •
+    <a href="#-installation">Installation</a> •
+    <a href="#-usage">Usage</a> •
+    <a href="#-configuration">Configuration</a> •
+    <a href="#-contributing">Contributing</a>
+  </p>
 
-## Installation
+  <p>
+    <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License">
+    <img src="https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen" alt="Node.js Version">
+    <img src="https://img.shields.io/badge/typescript-5.6-blue" alt="TypeScript">
+    <img src="https://img.shields.io/badge/powered%20by-browser.cash-orange" alt="Visit Browser.cash">
+  </p>
+
+  <p>
+    <a href="https://x.com/aibrowsers">
+      <img src="https://img.shields.io/badge/Follow%20on%20X-000000?style=for-the-badge&logo=x&logoColor=white" alt="Follow on X" />
+    </a>
+    <a href="https://linkedin.com/company/megatera">
+      <img src="https://img.shields.io/badge/Follow%20on%20LinkedIn-0077B5?style=for-the-badge&logo=linkedin&logoColor=white" alt="Follow on LinkedIn" />
+    </a>
+    <a href="https://discord.gg/F9afFJPtYb">
+      <img src="https://img.shields.io/badge/Join%20our%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join our Discord" />
+    </a>
+  </p>
+
+  <br>
+
+  <p>
+    💡 <strong>Pro Tip:</strong> See this library in action in 
+    <a href="https://github.com/Mega-Tera/teracrawl"><strong>Teracrawl</strong></a> and 
+    <a href="https://github.com/Mega-Tera/browser-serp"><strong>Browser SERP</strong></a>.
+  </p>
+</div>
+
+---
+
+## 🚀 What is Browser Pool?
+
+**Browser Pool** is a specialized library designed to manage pools of remote browser sessions. It handles the lifecycle of Playwright browsers connected to **Browser.cash**, ensuring your application always has a healthy browser ready to perform tasks.
+
+It abstracts away the complexity of connection management, error recovery, and session recycling, making it ideal for building high-concurrency scrapers and automation tools.
+
+## <a name="features"></a>✨ Features
+
+- **Automatic Pooling**: Maintains a fixed number of active browser sessions.
+- **Self-Healing**: Automatically detects and replaces dead or disconnected browsers.
+- **Health Checks**: Periodically verifies browser responsiveness.
+- **Concurrency Control**: Queues requests when all sessions are busy.
+- **Type-Safe**: Written in TypeScript with full type definitions.
+
+## <a name="installation"></a>🛠️ Installation
 
 ```bash
-npm install @browsercash/pool@git+https://github.com/Mega-Tera/browser-pool.git
+npm install @browsercash/pool
 ```
 
-## Usage
+_Note: You must also have `playwright-core` installed as a peer dependency._
+
+## <a name="usage"></a>💻 Usage
 
 ```typescript
-import { chromium } from 'playwright-core';
-import { SessionPool } from '@browsercash/pool';
+import { chromium } from "playwright-core";
+import { SessionPool } from "@browsercash/pool";
 
+// 1. Create the pool
 const pool = new SessionPool({
   apiKey: process.env.BROWSER_API_KEY,
-  chromium: chromium,
-  size: 3,
-  
-  // Optional configuration
-  maxUses: 50,                    // Max uses per session before recycling
-  maxAgeMs: 5 * 60 * 1000,        // Max age before recycling (5 min)
-  enableHealthCheck: true,        // Periodic health checks
-  healthCheckIntervalMs: 30_000,  // Health check interval
-  enableWaitQueue: true,          // Queue requests when pool exhausted
-  enableDisconnectHandling: true, // Handle CDP disconnects
-  debug: true,                    // Enable logging
+  chromium: chromium, // Inject your preferred chromium instance
+  size: 3, // Maintain 3 concurrent sessions
 });
 
+// 2. Initialize
 await pool.init();
 
-// Acquire a session
+// 3. Acquire a session (waits if none available)
 const session = await pool.acquire();
 
-// Use the browser
-const context = session.browser.contexts()[0] || await session.browser.newContext();
-const page = await context.newPage();
-// ...
+try {
+  // Use the standard Playwright browser instance
+  const page = await session.browser.newPage();
+  await page.goto("https://example.com");
+  console.log(await page.title());
+} finally {
+  // 4. Always release the session back to the pool
+  // Pass 'true' as second arg if the session encountered a fatal error
+  pool.release(session);
+}
 
-// Release back to pool
-pool.release(session);
-
-// Shutdown
+// 5. Cleanup on shutdown
 await pool.shutdown();
 ```
 
-## Configuration Options
+## <a name="configuration"></a>⚙️ Configuration
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `apiKey` | string | required | Browser.cash API key |
-| `chromium` | ChromiumModule | required | Chromium instance (playwright-core or patchright-core) |
-| `size` | number | required | Number of sessions to maintain |
-| `maxUses` | number | 50 | Max uses per session |
-| `maxAgeMs` | number | 300000 | Max session age (5 min) |
-| `enableHealthCheck` | boolean | false | Enable periodic health checks |
-| `healthCheckIntervalMs` | number | 30000 | Health check interval |
-| `enableWaitQueue` | boolean | true | Queue when pool exhausted |
-| `enableDisconnectHandling` | boolean | true | Handle CDP disconnects |
-| `debug` | boolean | false | Enable debug logging |
-| `logger` | function | console.log | Custom logger function |
+| Option                  | Type             | Default      | Description                                     |
+| :---------------------- | :--------------- | :----------- | :---------------------------------------------- |
+| `apiKey`                | `string`         | **Required** | Your Browser.cash API key.                      |
+| `chromium`              | `ChromiumModule` | **Required** | The Playwright Chromium module.                 |
+| `size`                  | `number`         | `1`          | Number of concurrent sessions to maintain.      |
+| `maxUses`               | `number`         | `50`         | Max times a browser is reused before recycling. |
+| `maxAgeMs`              | `number`         | `300000`     | Max age (ms) of a session (default: 5 mins).    |
+| `enableHealthCheck`     | `boolean`        | `false`      | Enable background health pings.                 |
+| `healthCheckIntervalMs` | `number`         | `30000`      | Interval for health checks (ms).                |
+| `enableWaitQueue`       | `boolean`        | `true`       | Queue acquire requests if pool is full.         |
+| `debug`                 | `boolean`        | `false`      | Enable verbose logging.                         |
 
+## <a name="contributing"></a>🤝 Contributing
+
+Contributions are welcome! We appreciate your help in making Browser Pool better.
+
+### How to Contribute
+
+1.  **Fork the Project**: click the 'Fork' button at the top right of this page.
+2.  **Create your Feature Branch**: `git checkout -b feature/AmazingFeature`
+3.  **Commit your Changes**: `git commit -m 'Add some AmazingFeature'`
+4.  **Push to the Branch**: `git push origin feature/AmazingFeature`
+5.  **Open a Pull Request**: Submit your changes for review.
+
+## 📄 License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
