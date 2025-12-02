@@ -38,8 +38,8 @@
 
   <p>
     💡 <strong>Pro Tip:</strong> See this library in action in 
-    <a href="https://github.com/Mega-Tera/teracrawl"><strong>Teracrawl</strong></a> and 
-    <a href="https://github.com/Mega-Tera/browser-serp"><strong>Browser SERP</strong></a>.
+    <a href="https://github.com/BrowserCash/teracrawl"><strong>Teracrawl</strong></a> and 
+    <a href="https://github.com/BrowserCash/browser-serp"><strong>Browser SERP</strong></a>.
   </p>
 </div>
 
