@@ -8,11 +8,11 @@
   </p>
 
   <p>
-    <a href="#-features">Features</a> •
-    <a href="#-installation">Installation</a> •
-    <a href="#-usage">Usage</a> •
-    <a href="#-configuration">Configuration</a> •
-    <a href="#-contributing">Contributing</a>
+    <a href="#features">Features</a> •
+    <a href="#installation">Installation</a> •
+    <a href="#usage">Usage</a> •
+    <a href="#configuration">Configuration</a> •
+    <a href="#contributing">Contributing</a>
   </p>
 
   <p>
@@ -51,7 +51,7 @@
 
 It abstracts away the complexity of connection management, error recovery, and session recycling, making it ideal for building high-concurrency scrapers and automation tools.
 
-## <a name="features"></a>✨ Features
+## <a id="features"></a>✨ Features
 
 - **Automatic Pooling**: Maintains a fixed number of active browser sessions.
 - **Self-Healing**: Automatically detects and replaces dead or disconnected browsers.
@@ -59,7 +59,7 @@ It abstracts away the complexity of connection management, error recovery, and s
 - **Concurrency Control**: Queues requests when all sessions are busy.
 - **Type-Safe**: Written in TypeScript with full type definitions.
 
-## <a name="installation"></a>🛠️ Installation
+## <a id="installation"></a>🛠️ Installation
 
 ```bash
 npm install @browsercash/pool
@@ -67,7 +67,7 @@ npm install @browsercash/pool
 
 _Note: You must also have `playwright-core` installed as a peer dependency._
 
-## <a name="usage"></a>💻 Usage
+## <a id="usage"></a>💻 Usage
 
 ```typescript
 import { chromium } from "playwright-core";
@@ -101,7 +101,7 @@ try {
 await pool.shutdown();
 ```
 
-## <a name="configuration"></a>⚙️ Configuration
+## <a id="configuration"></a>⚙️ Configuration
 
 | Option                  | Type             | Default      | Description                                     |
 | :---------------------- | :--------------- | :----------- | :---------------------------------------------- |
@@ -115,7 +115,7 @@ await pool.shutdown();
 | `enableWaitQueue`       | `boolean`        | `true`       | Queue acquire requests if pool is full.         |
 | `debug`                 | `boolean`        | `false`      | Enable verbose logging.                         |
 
-## <a name="contributing"></a>🤝 Contributing
+## <a id="contributing"></a>🤝 Contributing
 
 Contributions are welcome! We appreciate your help in making Browser Pool better.
 
