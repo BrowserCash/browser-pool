@@ -28,10 +28,12 @@ export class SessionPool {
   private readonly size: number;
   private readonly maxUses: number;
   private readonly maxAgeMs: number;
+  private readonly maxIdleMs: number;
   private readonly enableHealthCheck: boolean;
   private readonly healthCheckIntervalMs: number;
   private readonly enableWaitQueue: boolean;
   private readonly enableDisconnectHandling: boolean;
+  private readonly createPage: boolean;
   private readonly debug: boolean;
   private readonly logger: (message: string, data?: Record<string, any>) => void;
 
@@ -41,10 +43,12 @@ export class SessionPool {
     this.size = config.size;
     this.maxUses = config.maxUses ?? 50;
     this.maxAgeMs = config.maxAgeMs ?? 5 * 60 * 1000;
+    this.maxIdleMs = config.maxIdleMs ?? 2 * 60 * 1000; // 2 minutes default
     this.enableHealthCheck = config.enableHealthCheck ?? false;
     this.healthCheckIntervalMs = config.healthCheckIntervalMs ?? 30_000;
     this.enableWaitQueue = config.enableWaitQueue ?? true;
     this.enableDisconnectHandling = config.enableDisconnectHandling ?? true;
+    this.createPage = config.createPage ?? false;
     this.debug = config.debug ?? false;
     this.logger = config.logger ?? ((msg, data) => {
       if (data) {
@@ -104,26 +108,100 @@ export class SessionPool {
   }
 
   private performHealthCheck(): void {
-    this.log("[pool] health check", { ...this.stats() });
-
-    const toRemove: PooledSession[] = [];
+    const toReplace: PooledSession[] = [];
     for (const session of this.available) {
-      if (!this.isUsable(session)) toRemove.push(session);
+      if (!this.isUsable(session)) toReplace.push(session);
     }
 
-    for (const session of toRemove) {
-      const idx = this.available.indexOf(session);
-      if (idx !== -1) {
-        this.available.splice(idx, 1);
-        this.closeSession(session).catch((err) => {
-          this.log("[pool] closeSession failed during health-check", { 
-            error: err instanceof Error ? err.message : String(err) 
+    const deficit = this.size - this.totalCount;
+    
+    // Only log if there are issues (sessions to replace or pool is below capacity)
+    if (toReplace.length > 0 || deficit > 0) {
+      this.log("[pool] health check: issues found", { 
+        toReplace: toReplace.length, 
+        deficit,
+        ...this.stats() 
+      });
+    }
+
+    // Replace each unusable session: create new one first, then remove old
+    for (const oldSession of toReplace) {
+      this.replaceSession(oldSession).catch((err) => {
+        this.log("[pool] replaceSession failed during health-check", { 
+          error: err instanceof Error ? err.message : String(err) 
+        });
+      });
+    }
+
+    // Also replenish if we're below target (e.g., sessions that failed to create)
+    this.replenish();
+  }
+
+  /**
+   * Replace a session: create new one first, confirm it's good, then remove old
+   */
+  private async replaceSession(oldSession: PooledSession): Promise<void> {
+    if (this.closed) return;
+
+    const oldSessionId = oldSession.sessionId;
+    this.log("[pool] replacing session", { sessionId: oldSessionId });
+
+    try {
+      // Create new session first
+      const newSession = await this.createSession();
+
+      // Attach disconnect handler to new session
+      if (this.enableDisconnectHandling && typeof newSession.browser.on === "function") {
+        newSession.browser.on("disconnected", () => {
+          this.log("[pool] browser disconnected", {
+            sessionId: newSession.sessionId,
+            ageMs: Date.now() - newSession.createdAt,
+            useCount: newSession.useCount,
           });
+          const availIdx = this.available.indexOf(newSession);
+          if (availIdx !== -1) this.available.splice(availIdx, 1);
+          if (this.inUse.has(newSession)) this.inUse.delete(newSession);
+          this.closeSession(newSession).catch(() => {});
+          this.replenish();
         });
       }
-    }
 
-    this.replenish();
+      // New session is good - now remove old one
+      const idx = this.available.indexOf(oldSession);
+      if (idx !== -1) {
+        this.available.splice(idx, 1);
+      }
+
+      // Add new session to pool
+      this.available.push(newSession);
+
+      this.log("[pool] session replaced", { 
+        oldSessionId, 
+        newSessionId: newSession.sessionId,
+        ...this.stats() 
+      });
+
+      // Close old session in background
+      this.closeSession(oldSession).catch((err) => {
+        this.log("[pool] closeSession failed for replaced session", { 
+          sessionId: oldSessionId,
+          error: err instanceof Error ? err.message : String(err) 
+        });
+      });
+
+    } catch (err) {
+      this.log("[pool] failed to create replacement session", { 
+        oldSessionId,
+        error: err instanceof Error ? err.message : String(err) 
+      });
+      // Still remove the old unusable session
+      const idx = this.available.indexOf(oldSession);
+      if (idx !== -1) {
+        this.available.splice(idx, 1);
+        this.closeSession(oldSession).catch(() => {});
+      }
+      // replenish() will be called after to try again
+    }
   }
 
   private replenish(): void {
@@ -151,14 +229,48 @@ export class SessionPool {
       cdpUrl: `https://dash.browser.cash/cdp_tabs?ws=${encodeURIComponent(session.cdpUrl)}`,
     });
 
-    const browser = await this.chromium.connectOverCDP(session.cdpUrl);
+    let browser;
+    try {
+      browser = await this.chromium.connectOverCDP(session.cdpUrl);
+    } catch (err) {
+      // CDP connection failed - stop the Browser.cash session so it doesn't dangle
+      this.log("[pool] CDP connection failed, stopping session", {
+        sessionId: session.sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      try {
+        await this.sdk.browser.session.stop({ sessionId: session.sessionId });
+      } catch {}
+      throw err;
+    }
+    
+    // Ensure a context exists so parallel work doesn't race on first context creation
+    let context: any | undefined;
+    if (typeof browser.contexts === "function") {
+      const contexts = browser.contexts();
+      if (Array.isArray(contexts) && contexts.length > 0) {
+        context = contexts[0];
+      } else if (typeof browser.newContext === "function") {
+        context = await browser.newContext();
+      }
+    }
 
+    // Optionally create a Page for consumers that want a ready-to-use tab
+    let page: any | undefined;
+    if (this.createPage && context && typeof context.newPage === "function") {
+      page = await context.newPage();
+    }
+
+    const now = Date.now();
     return {
       sessionId: session.sessionId,
       cdpUrl: session.cdpUrl,
       browser,
-      createdAt: Date.now(),
+      createdAt: now,
       useCount: 0,
+      lastUsedAt: now,
+      context,
+      page,
     };
   }
 
@@ -188,6 +300,7 @@ export class SessionPool {
     if (!session.browser.isConnected()) return false;
     if (session.useCount >= this.maxUses) return false;
     if (Date.now() - session.createdAt > this.maxAgeMs) return false;
+    if (Date.now() - session.lastUsedAt > this.maxIdleMs) return false; // Idle timeout
     return true;
   }
 
@@ -361,6 +474,9 @@ export class SessionPool {
       });
       this.replenish();
     } else {
+      // Update lastUsedAt since session was just used
+      session.lastUsedAt = Date.now();
+      
       // If someone is waiting, give them the session
       if (this.enableWaitQueue && this.waitQueue.length > 0) {
         const waiter = this.waitQueue.shift()!;

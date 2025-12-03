@@ -16,10 +16,12 @@ export declare class SessionPool {
     private readonly size;
     private readonly maxUses;
     private readonly maxAgeMs;
+    private readonly maxIdleMs;
     private readonly enableHealthCheck;
     private readonly healthCheckIntervalMs;
     private readonly enableWaitQueue;
     private readonly enableDisconnectHandling;
+    private readonly createPage;
     private readonly debug;
     private readonly logger;
     constructor(config: PoolConfig);
@@ -31,6 +33,10 @@ export declare class SessionPool {
     init(): Promise<void>;
     private startHealthCheck;
     private performHealthCheck;
+    /**
+     * Replace a session: create new one first, confirm it's good, then remove old
+     */
+    private replaceSession;
     private replenish;
     private createSession;
     private closeSession;
