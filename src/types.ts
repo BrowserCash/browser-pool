@@ -31,6 +31,8 @@ export interface PooledSession {
   context?: any;
   /** Optional: Pre-created Page for this session when enabled via config */
   page?: any;
+  /** Optional: The node ID that this session is running on */
+  nodeId?: string;
 }
 
 /**

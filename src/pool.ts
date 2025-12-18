@@ -271,6 +271,7 @@ export class SessionPool {
       lastUsedAt: now,
       context,
       page,
+      nodeId: session.servedBy,
     };
   }
 
