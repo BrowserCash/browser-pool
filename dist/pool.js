@@ -1,8 +1,8 @@
 import BrowsercashSDK from "@browsercash/sdk";
 /**
- * Browser session pool for Browser.cash
+ * Browser session pool for Browser.cash.
  *
- * Manages a pool of browser sessions for efficient reuse.
+ * Manages a target-aware pool of browser sessions for efficient reuse.
  */
 export class SessionPool {
     available = [];
@@ -10,16 +10,24 @@ export class SessionPool {
     creating = 0;
     closed = false;
     healthCheckTimer = null;
+    healthCheckInFlight = false;
+    replenishPromise = null;
     waitQueue = [];
+    creatingByTarget = new Map();
     sdk;
     chromium;
-    size;
+    targets;
+    targetCounts = new Map();
     maxUses;
     maxAgeMs;
     maxIdleMs;
     enableHealthCheck;
     healthCheckIntervalMs;
+    healthCheckTimeoutMs;
+    sessionReadyTimeoutMs;
+    cdpConnectTimeoutMs;
     enableWaitQueue;
+    waitQueueTimeoutMs;
     enableDisconnectHandling;
     createPage;
     debug;
@@ -27,22 +35,28 @@ export class SessionPool {
     constructor(config) {
         this.sdk = new BrowsercashSDK({ apiKey: config.apiKey });
         this.chromium = config.chromium;
-        this.size = config.size;
+        this.targets = expandTargets(config);
+        this.targetCounts = buildTargetCountMap(this.targets);
         this.maxUses = config.maxUses ?? 50;
         this.maxAgeMs = config.maxAgeMs ?? 5 * 60 * 1000;
-        this.maxIdleMs = config.maxIdleMs ?? 2 * 60 * 1000; // 2 minutes default
+        this.maxIdleMs = normalizeIdleTimeout(config.maxIdleMs);
         this.enableHealthCheck = config.enableHealthCheck ?? false;
         this.healthCheckIntervalMs = config.healthCheckIntervalMs ?? 30_000;
+        this.healthCheckTimeoutMs =
+            config.healthCheckTimeoutMs ?? Math.min(this.healthCheckIntervalMs, 10_000);
+        this.sessionReadyTimeoutMs = config.sessionReadyTimeoutMs ?? 20_000;
+        this.cdpConnectTimeoutMs = config.cdpConnectTimeoutMs ?? 15_000;
         this.enableWaitQueue = config.enableWaitQueue ?? true;
+        this.waitQueueTimeoutMs = config.waitQueueTimeoutMs ?? 60_000;
         this.enableDisconnectHandling = config.enableDisconnectHandling ?? true;
         this.createPage = config.createPage ?? false;
         this.debug = config.debug ?? false;
-        this.logger = config.logger ?? ((msg, data) => {
+        this.logger = config.logger ?? ((message, data) => {
             if (data) {
-                console.log(msg, data);
+                console.log(message, data);
             }
             else {
-                console.log(msg);
+                console.log(message);
             }
         });
     }
@@ -51,22 +65,21 @@ export class SessionPool {
             this.logger(message, data);
         }
     }
+    get size() {
+        return this.targets.length;
+    }
     get totalCount() {
         return this.available.length + this.inUse.size + this.creating;
     }
     /**
-     * Initialize the pool with pre-warmed sessions
+     * Initialize the pool with pre-warmed sessions.
      */
     async init() {
-        this.log("[pool] initializing", { size: this.size });
-        const warmupPromises = [];
-        for (let i = 0; i < this.size; i++) {
-            warmupPromises.push(this.addSession());
+        this.log("[pool] initializing", { size: this.size, targets: this.targetCounts.size });
+        await this.replenish();
+        if (this.available.length === 0 && this.inUse.size === 0) {
+            throw new Error("Failed to initialize pool: no Browser.cash sessions became ready");
         }
-        // Wait for at least one session to be ready
-        await Promise.race(warmupPromises);
-        // Wait for all warmup to complete
-        await Promise.allSettled(warmupPromises);
         if (this.enableHealthCheck) {
             this.startHealthCheck();
         }
@@ -78,138 +91,211 @@ export class SessionPool {
         this.healthCheckTimer = setInterval(() => {
             if (this.closed)
                 return;
-            this.performHealthCheck();
+            void this.performHealthCheck();
         }, this.healthCheckIntervalMs);
-        // Don't prevent process exit
         if (this.healthCheckTimer.unref) {
             this.healthCheckTimer.unref();
         }
     }
-    performHealthCheck() {
-        const toReplace = [];
-        for (const session of this.available) {
-            if (!this.isUsable(session))
-                toReplace.push(session);
-        }
-        const deficit = this.size - this.totalCount;
-        // Only log if there are issues (sessions to replace or pool is below capacity)
-        if (toReplace.length > 0 || deficit > 0) {
-            this.log("[pool] health check: issues found", {
-                toReplace: toReplace.length,
-                deficit,
-                ...this.stats()
-            });
-        }
-        // Replace each unusable session: create new one first, then remove old
-        for (const oldSession of toReplace) {
-            this.replaceSession(oldSession).catch((err) => {
-                this.log("[pool] replaceSession failed during health-check", {
-                    error: err instanceof Error ? err.message : String(err)
+    async performHealthCheck() {
+        if (this.healthCheckInFlight || this.closed)
+            return;
+        this.healthCheckInFlight = true;
+        try {
+            const snapshot = [...this.available];
+            const toReplace = [];
+            await Promise.allSettled(snapshot.map(async (session) => {
+                if (!(await this.isHealthy(session))) {
+                    toReplace.push(session);
+                }
+            }));
+            const deficit = this.collectMissingTargets().length;
+            if (toReplace.length > 0 || deficit > 0) {
+                this.log("[pool] health check: issues found", {
+                    toReplace: toReplace.length,
+                    deficit,
+                    ...this.stats(),
                 });
-            });
+            }
+            await Promise.allSettled(toReplace.map((session) => this.replaceSession(session).catch((error) => {
+                this.log("[pool] replaceSession failed during health-check", {
+                    sessionId: session.sessionId,
+                    error: error instanceof Error ? error.message : String(error),
+                });
+            })));
+            if (!this.closed) {
+                await this.replenish();
+            }
         }
-        // Also replenish if we're below target (e.g., sessions that failed to create)
-        this.replenish();
+        finally {
+            this.healthCheckInFlight = false;
+        }
     }
-    /**
-     * Replace a session: create new one first, confirm it's good, then remove old
-     */
     async replaceSession(oldSession) {
         if (this.closed)
             return;
-        const oldSessionId = oldSession.sessionId;
-        this.log("[pool] replacing session", { sessionId: oldSessionId });
-        try {
-            // Create new session first
-            const newSession = await this.createSession();
-            // Attach disconnect handler to new session
-            if (this.enableDisconnectHandling && typeof newSession.browser.on === "function") {
-                newSession.browser.on("disconnected", () => {
-                    this.log("[pool] browser disconnected", {
-                        sessionId: newSession.sessionId,
-                        ageMs: Date.now() - newSession.createdAt,
-                        useCount: newSession.useCount,
-                    });
-                    const availIdx = this.available.indexOf(newSession);
-                    if (availIdx !== -1)
-                        this.available.splice(availIdx, 1);
-                    if (this.inUse.has(newSession))
-                        this.inUse.delete(newSession);
-                    this.closeSession(newSession).catch(() => { });
-                    this.replenish();
-                });
-            }
-            // New session is good - now remove old one
-            const idx = this.available.indexOf(oldSession);
-            if (idx !== -1) {
-                this.available.splice(idx, 1);
-            }
-            // Add new session to pool
-            this.available.push(newSession);
-            this.log("[pool] session replaced", {
-                oldSessionId,
-                newSessionId: newSession.sessionId,
-                ...this.stats()
-            });
-            // Close old session in background
-            this.closeSession(oldSession).catch((err) => {
-                this.log("[pool] closeSession failed for replaced session", {
-                    sessionId: oldSessionId,
-                    error: err instanceof Error ? err.message : String(err)
-                });
-            });
-        }
-        catch (err) {
-            this.log("[pool] failed to create replacement session", {
-                oldSessionId,
-                error: err instanceof Error ? err.message : String(err)
-            });
-            // Still remove the old unusable session
-            const idx = this.available.indexOf(oldSession);
-            if (idx !== -1) {
-                this.available.splice(idx, 1);
-                this.closeSession(oldSession).catch(() => { });
-            }
-            // replenish() will be called after to try again
-        }
-    }
-    replenish() {
-        const deficit = this.size - this.totalCount;
-        if (deficit <= 0)
+        const target = this.targets.find((entry) => entry.slotId === oldSession.targetSlotId);
+        if (!target) {
+            await this.removeAndClose(oldSession);
             return;
-        this.log("[pool] replenishing", { deficit, ...this.stats() });
-        this.addSession().catch((err) => {
-            this.log("[pool] replenish addSession failed", {
-                error: err instanceof Error ? err.message : String(err)
-            });
-        });
-    }
-    async createSession() {
-        const session = await this.sdk.browser.session.create();
-        if (!session.cdpUrl) {
-            throw new Error("No CDP URL returned for session");
         }
-        this.log("[cdp] session ready", {
-            sessionId: session.sessionId,
-            cdpUrl: `https://dash.browser.cash/cdp_tabs?ws=${encodeURIComponent(session.cdpUrl)}`,
+        this.log("[pool] replacing session", {
+            sessionId: oldSession.sessionId,
+            targetId: target.targetId,
+            targetSlotId: target.slotId,
         });
-        let browser;
+        const idx = this.available.indexOf(oldSession);
+        if (idx === -1) {
+            return;
+        }
         try {
-            browser = await this.chromium.connectOverCDP(session.cdpUrl);
-        }
-        catch (err) {
-            // CDP connection failed - stop the Browser.cash session so it doesn't dangle
-            this.log("[pool] CDP connection failed, stopping session", {
-                sessionId: session.sessionId,
-                error: err instanceof Error ? err.message : String(err),
+            const newSession = await this.createSessionForTarget(target);
+            this.attachDisconnectHandler(newSession);
+            if (this.closed) {
+                await this.closeSession(newSession);
+                return;
+            }
+            this.available.splice(idx, 1);
+            this.enqueueAvailableSession(newSession);
+            this.log("[pool] session replaced", {
+                oldSessionId: oldSession.sessionId,
+                newSessionId: newSession.sessionId,
+                targetId: target.targetId,
+                targetSlotId: target.slotId,
+                ...this.stats(),
             });
+            this.closeSession(oldSession).catch((error) => {
+                this.log("[pool] closeSession failed for replaced session", {
+                    sessionId: oldSession.sessionId,
+                    error: error instanceof Error ? error.message : String(error),
+                });
+            });
+        }
+        catch (error) {
+            this.available.splice(idx, 1);
+            this.closeSession(oldSession).catch(() => { });
+            this.log("[pool] failed to create replacement session", {
+                oldSessionId: oldSession.sessionId,
+                targetId: target.targetId,
+                targetSlotId: target.slotId,
+                error: error instanceof Error ? error.message : String(error),
+            });
+            this.scheduleTargetRetry(target);
+        }
+    }
+    async replenish() {
+        if (this.closed)
+            return;
+        if (this.replenishPromise) {
+            await this.replenishPromise;
+            return;
+        }
+        this.replenishPromise = this.runReplenish().finally(() => {
+            this.replenishPromise = null;
+        });
+        await this.replenishPromise;
+    }
+    async runReplenish() {
+        const missingTargets = this.collectMissingTargets();
+        if (missingTargets.length === 0)
+            return;
+        this.log("[pool] replenishing", {
+            deficit: missingTargets.length,
+            ...this.stats(),
+        });
+        await Promise.allSettled(missingTargets.map((target) => this.addSession(target).catch((error) => {
+            this.log("[pool] replenish addSession failed", {
+                targetId: target.targetId,
+                targetSlotId: target.slotId,
+                error: error instanceof Error ? error.message : String(error),
+            });
+        })));
+    }
+    async addSession(target) {
+        if (this.closed)
+            return;
+        if (this.hasSessionForTarget(target.slotId) || this.getCreatingCount(target.slotId) > 0) {
+            return;
+        }
+        this.incrementCreating(target.slotId);
+        try {
+            const session = await this.createSessionForTarget(target);
+            this.attachDisconnectHandler(session);
+            if (this.closed) {
+                await this.closeSession(session);
+                return;
+            }
+            if (this.hasSessionForTarget(target.slotId)) {
+                this.log("[pool] target already filled after create, closing duplicate", {
+                    sessionId: session.sessionId,
+                    targetId: target.targetId,
+                    targetSlotId: target.slotId,
+                });
+                await this.closeSession(session);
+                return;
+            }
+            this.enqueueAvailableSession(session);
+            this.log("[pool] session added to pool", {
+                sessionId: session.sessionId,
+                targetId: target.targetId,
+                targetSlotId: target.slotId,
+                nodeId: session.nodeId,
+                ...this.stats(),
+            });
+        }
+        catch (error) {
+            this.log("[pool] failed to create session", {
+                targetId: target.targetId,
+                targetSlotId: target.slotId,
+                error: error instanceof Error ? error.message : String(error),
+            });
+            this.scheduleTargetRetry(target);
+            throw error;
+        }
+        finally {
+            this.decrementCreating(target.slotId);
+        }
+    }
+    async createSessionForTarget(target) {
+        const session = await this.sdk.browser.session.create(target.createOptions);
+        const readySession = await this.awaitSessionReady({
+            sessionId: session.sessionId,
+            cdpUrl: session.cdpUrl,
+            servedBy: session.servedBy,
+            status: session.status,
+        });
+        if (!readySession?.cdpUrl) {
             try {
                 await this.sdk.browser.session.stop({ sessionId: session.sessionId });
             }
             catch { }
-            throw err;
+            throw new Error("No CDP URL returned for session");
         }
-        // Ensure a context exists so parallel work doesn't race on first context creation
+        this.log("[cdp] session ready", {
+            sessionId: readySession.sessionId,
+            targetId: target.targetId,
+            targetSlotId: target.slotId,
+            cdpUrl: `https://dash.browser.cash/cdp_tabs?ws=${encodeURIComponent(readySession.cdpUrl)}`,
+        });
+        let browser;
+        try {
+            browser = await this.withTimeout(this.chromium.connectOverCDP(readySession.cdpUrl, {
+                timeout: this.cdpConnectTimeoutMs,
+            }), this.cdpConnectTimeoutMs + 2_000, `CDP connect timed out for ${readySession.sessionId}`);
+        }
+        catch (error) {
+            this.log("[pool] CDP connection failed, stopping session", {
+                sessionId: readySession.sessionId,
+                targetId: target.targetId,
+                targetSlotId: target.slotId,
+                error: error instanceof Error ? error.message : String(error),
+            });
+            try {
+                await this.sdk.browser.session.stop({ sessionId: readySession.sessionId });
+            }
+            catch { }
+            throw error;
+        }
         let context;
         if (typeof browser.contexts === "function") {
             const contexts = browser.contexts();
@@ -220,23 +306,47 @@ export class SessionPool {
                 context = await browser.newContext();
             }
         }
-        // Optionally create a Page for consumers that want a ready-to-use tab
         let page;
         if (this.createPage && context && typeof context.newPage === "function") {
             page = await context.newPage();
         }
         const now = Date.now();
         return {
-            sessionId: session.sessionId,
-            cdpUrl: session.cdpUrl,
+            sessionId: readySession.sessionId,
+            cdpUrl: readySession.cdpUrl,
             browser,
             createdAt: now,
             useCount: 0,
             lastUsedAt: now,
             context,
             page,
-            nodeId: session.servedBy,
+            nodeId: readySession.servedBy,
+            targetId: target.targetId,
+            targetSlotId: target.slotId,
         };
+    }
+    attachDisconnectHandler(session) {
+        if (!this.enableDisconnectHandling || typeof session.browser.on !== "function") {
+            return;
+        }
+        session.browser.on("disconnected", () => {
+            this.log("[pool] browser disconnected", {
+                sessionId: session.sessionId,
+                targetId: session.targetId,
+                targetSlotId: session.targetSlotId,
+                ageMs: Date.now() - session.createdAt,
+                useCount: session.useCount,
+            });
+            this.removeSessionReferences(session);
+            this.closeSession(session).catch(() => { });
+            const target = this.targets.find((entry) => entry.slotId === session.targetSlotId);
+            if (target) {
+                this.scheduleTargetRetry(target);
+            }
+            else {
+                void this.replenish().catch(() => { });
+            }
+        });
     }
     async closeSession(session) {
         if (!session)
@@ -244,19 +354,49 @@ export class SessionPool {
         try {
             await session.browser.close().catch(() => { });
         }
-        catch (err) {
+        catch (error) {
             this.log("[pool] browser close warning", {
-                error: err instanceof Error ? err.message : String(err)
+                sessionId: session.sessionId,
+                error: error instanceof Error ? error.message : String(error),
             });
         }
         try {
             await this.sdk.browser.session.stop({ sessionId: session.sessionId });
-            this.log("[session] stopped", { sessionId: session.sessionId });
-        }
-        catch (err) {
-            this.log("[session] stop API failed", {
-                error: err instanceof Error ? err.message : String(err)
+            this.log("[session] stopped", {
+                sessionId: session.sessionId,
+                targetId: session.targetId,
+                targetSlotId: session.targetSlotId,
             });
+        }
+        catch (error) {
+            this.log("[session] stop API failed", {
+                sessionId: session.sessionId,
+                error: error instanceof Error ? error.message : String(error),
+            });
+        }
+    }
+    async isHealthy(session) {
+        if (!this.isUsable(session))
+            return false;
+        if (!session)
+            return false;
+        try {
+            const remote = await this.withTimeout(this.sdk.browser.session.get({ sessionId: session.sessionId }), this.healthCheckTimeoutMs, `Health check timed out for ${session.sessionId}`);
+            if (remote.status === "completed" || remote.status === "error") {
+                return false;
+            }
+            if (!remote.cdpUrl || remote.cdpUrl !== session.cdpUrl) {
+                return false;
+            }
+            session.nodeId = remote.servedBy;
+            return true;
+        }
+        catch (error) {
+            this.log("[pool] remote health check failed", {
+                sessionId: session.sessionId,
+                error: error instanceof Error ? error.message : String(error),
+            });
+            return false;
         }
     }
     isUsable(session) {
@@ -268,156 +408,53 @@ export class SessionPool {
             return false;
         if (Date.now() - session.createdAt > this.maxAgeMs)
             return false;
-        if (Date.now() - session.lastUsedAt > this.maxIdleMs)
-            return false; // Idle timeout
+        if (this.maxIdleMs !== null && this.maxIdleMs > 0) {
+            if (Date.now() - session.lastUsedAt > this.maxIdleMs)
+                return false;
+        }
         return true;
     }
-    async addSession() {
-        if (this.closed)
-            return;
-        this.creating++;
-        if (this.totalCount > this.size) {
-            this.creating--;
-            this.log("[pool] addSession: already at capacity, aborting", { ...this.stats() });
-            return;
-        }
-        try {
-            const session = await this.createSession();
-            // Attach disconnect handler
-            if (this.enableDisconnectHandling && typeof session.browser.on === "function") {
-                session.browser.on("disconnected", () => {
-                    this.log("[pool] browser disconnected", {
-                        sessionId: session.sessionId,
-                        ageMs: Date.now() - session.createdAt,
-                        useCount: session.useCount,
-                    });
-                    // Remove from any lists
-                    const availIdx = this.available.indexOf(session);
-                    if (availIdx !== -1)
-                        this.available.splice(availIdx, 1);
-                    if (this.inUse.has(session))
-                        this.inUse.delete(session);
-                    // Close and replenish
-                    this.closeSession(session).catch(() => { });
-                    this.replenish();
-                });
-            }
-            if (this.closed) {
-                await this.closeSession(session);
-                return;
-            }
-            if (this.totalCount > this.size) {
-                this.log("[pool] addSession: over capacity after create, closing", {
-                    sessionId: session.sessionId,
-                    ...this.stats(),
-                });
-                await this.closeSession(session);
-                return;
-            }
-            // If someone is waiting, give them the session
-            if (this.enableWaitQueue && this.waitQueue.length > 0) {
-                const waiter = this.waitQueue.shift();
-                this.inUse.add(session);
-                session.useCount++;
-                this.log("[pool] session created and assigned to waiter", {
-                    sessionId: session.sessionId,
-                    ...this.stats(),
-                });
-                waiter.resolve(session);
-            }
-            else {
-                this.available.push(session);
-                this.log("[pool] session added to pool", {
-                    sessionId: session.sessionId,
-                    ...this.stats(),
-                });
-            }
-            // Continue filling pool if needed
-            if (this.totalCount < this.size && !this.closed) {
-                setImmediate(() => this.addSession().catch(() => { }));
-            }
-        }
-        catch (err) {
-            this.log("[pool] failed to create session", {
-                error: err instanceof Error ? err.message : String(err)
-            });
-            // Reject a waiter if there is one
-            if (this.enableWaitQueue && this.waitQueue.length > 0) {
-                const waiter = this.waitQueue.shift();
-                waiter.reject(err instanceof Error ? err : new Error(String(err)));
-            }
-            // Retry after delay
-            if (!this.closed && this.totalCount < this.size) {
-                setTimeout(() => this.addSession().catch(() => { }), 5000);
-            }
-        }
-        finally {
-            this.creating--;
-        }
-    }
     /**
-     * Acquire a session from the pool
+     * Acquire a session from the pool.
      */
     async acquire() {
-        // Try to get an available session
         while (this.available.length > 0) {
             const session = this.available.pop();
             if (this.isUsable(session)) {
                 this.inUse.add(session);
                 session.useCount++;
+                session.lastUsedAt = Date.now();
                 this.log("[pool] acquired", {
                     sessionId: session.sessionId,
+                    targetId: session.targetId,
+                    targetSlotId: session.targetSlotId,
                     useCount: session.useCount,
                     ...this.stats(),
                 });
                 return session;
             }
             this.closeSession(session).catch(() => { });
-        }
-        // Create on-demand if under capacity
-        this.creating++;
-        if (this.totalCount <= this.size) {
-            this.log("[browser miss] no available sessions; creating on-demand");
-            try {
-                const session = await this.createSession();
-                if (this.totalCount > this.size) {
-                    this.log("[pool] over capacity after on-demand create, closing", {
-                        sessionId: session.sessionId,
-                        ...this.stats(),
-                    });
-                    this.creating--;
-                    await this.closeSession(session);
-                }
-                else {
-                    this.creating--;
-                    this.inUse.add(session);
-                    session.useCount++;
-                    this.log("[pool] on-demand session created", {
-                        sessionId: session.sessionId,
-                        ...this.stats(),
-                    });
-                    return session;
-                }
-            }
-            catch (err) {
-                this.creating--;
-                throw err;
+            const target = this.targets.find((entry) => entry.slotId === session.targetSlotId);
+            if (target) {
+                this.scheduleTargetRetry(target);
             }
         }
-        else {
-            this.creating--;
+        const missingTarget = this.pickMissingTarget();
+        if (missingTarget) {
+            this.log("[pool] no available sessions; creating on-demand", {
+                targetId: missingTarget.targetId,
+                targetSlotId: missingTarget.slotId,
+            });
+            return this.createSessionForAcquire(missingTarget);
         }
-        // Wait queue if enabled
         if (this.enableWaitQueue) {
             this.log("[pool] at capacity, waiting for session", { ...this.stats() });
-            return new Promise((resolve, reject) => {
-                this.waitQueue.push({ resolve, reject });
-            });
+            return this.waitForSession();
         }
         throw new Error("Pool exhausted and wait queue disabled");
     }
     /**
-     * Release a session back to the pool
+     * Release a session back to the pool.
      */
     release(session, error) {
         this.inUse.delete(session);
@@ -425,35 +462,27 @@ export class SessionPool {
             this.closeSession(session).catch(() => { });
             this.log("[pool] released (unusable/error)", {
                 sessionId: session.sessionId,
+                targetId: session.targetId,
+                targetSlotId: session.targetSlotId,
                 ...this.stats(),
             });
-            this.replenish();
-        }
-        else {
-            // Update lastUsedAt since session was just used
-            session.lastUsedAt = Date.now();
-            // If someone is waiting, give them the session
-            if (this.enableWaitQueue && this.waitQueue.length > 0) {
-                const waiter = this.waitQueue.shift();
-                this.inUse.add(session);
-                session.useCount++;
-                this.log("[pool] session reassigned to waiter", {
-                    sessionId: session.sessionId,
-                    ...this.stats(),
-                });
-                waiter.resolve(session);
+            const target = this.targets.find((entry) => entry.slotId === session.targetSlotId);
+            if (target) {
+                this.scheduleTargetRetry(target);
             }
-            else {
-                this.available.push(session);
-                this.log("[pool] released", {
-                    sessionId: session.sessionId,
-                    ...this.stats(),
-                });
-            }
+            return;
         }
+        session.lastUsedAt = Date.now();
+        this.enqueueAvailableSession(session);
+        this.log("[pool] released", {
+            sessionId: session.sessionId,
+            targetId: session.targetId,
+            targetSlotId: session.targetSlotId,
+            ...this.stats(),
+        });
     }
     /**
-     * Shutdown the pool and close all sessions
+     * Shutdown the pool and close all sessions.
      */
     async shutdown() {
         this.closed = true;
@@ -461,20 +490,23 @@ export class SessionPool {
             clearInterval(this.healthCheckTimer);
             this.healthCheckTimer = null;
         }
-        // Reject all waiters
         while (this.waitQueue.length > 0) {
             const waiter = this.waitQueue.shift();
+            waiter.settled = true;
+            if (waiter.timeoutId) {
+                clearTimeout(waiter.timeoutId);
+            }
             waiter.reject(new Error("Pool shutting down"));
         }
         const allSessions = [...this.available, ...this.inUse];
         this.available = [];
         this.inUse.clear();
         this.log("[pool] shutting down", { count: allSessions.length });
-        await Promise.all(allSessions.map((s) => this.closeSession(s).catch(() => { })));
+        await Promise.all(allSessions.map((session) => this.closeSession(session).catch(() => { })));
         this.log("[pool] shutdown complete");
     }
     /**
-     * Get pool statistics
+     * Get pool statistics.
      */
     stats() {
         return {
@@ -484,7 +516,299 @@ export class SessionPool {
             waiting: this.waitQueue.length,
             total: this.totalCount,
             maxSize: this.size,
+            desired: this.size,
+            targets: this.buildTargetStats(),
         };
     }
+    async createSessionForAcquire(target) {
+        if (this.hasSessionForTarget(target.slotId) || this.getCreatingCount(target.slotId) > 0) {
+            return this.acquire();
+        }
+        this.incrementCreating(target.slotId);
+        try {
+            const session = await this.createSessionForTarget(target);
+            this.attachDisconnectHandler(session);
+            if (this.closed) {
+                await this.closeSession(session);
+                throw new Error("Pool is closed");
+            }
+            if (this.hasSessionForTarget(target.slotId)) {
+                await this.closeSession(session);
+                return this.acquire();
+            }
+            this.inUse.add(session);
+            session.useCount++;
+            session.lastUsedAt = Date.now();
+            this.log("[pool] on-demand session created", {
+                sessionId: session.sessionId,
+                targetId: session.targetId,
+                targetSlotId: session.targetSlotId,
+                ...this.stats(),
+            });
+            return session;
+        }
+        finally {
+            this.decrementCreating(target.slotId);
+        }
+    }
+    enqueueAvailableSession(session) {
+        if (this.enableWaitQueue) {
+            const waiter = this.shiftWaiter();
+            if (waiter) {
+                this.inUse.add(session);
+                session.useCount++;
+                session.lastUsedAt = Date.now();
+                waiter.settled = true;
+                if (waiter.timeoutId) {
+                    clearTimeout(waiter.timeoutId);
+                }
+                waiter.resolve(session);
+                this.log("[pool] session assigned to waiter", {
+                    sessionId: session.sessionId,
+                    targetId: session.targetId,
+                    targetSlotId: session.targetSlotId,
+                    ...this.stats(),
+                });
+                return;
+            }
+        }
+        this.available.push(session);
+    }
+    waitForSession() {
+        return new Promise((resolve, reject) => {
+            const entry = {
+                resolve,
+                reject,
+                timeoutId: null,
+                settled: false,
+            };
+            entry.timeoutId = setTimeout(() => {
+                if (entry.settled)
+                    return;
+                entry.settled = true;
+                this.removeWaiter(entry);
+                reject(new Error("Timed out waiting for an available pooled session"));
+            }, this.waitQueueTimeoutMs);
+            this.waitQueue.push(entry);
+            void this.replenish().catch(() => { });
+        });
+    }
+    shiftWaiter() {
+        while (this.waitQueue.length > 0) {
+            const waiter = this.waitQueue.shift();
+            if (!waiter.settled) {
+                return waiter;
+            }
+        }
+        return undefined;
+    }
+    removeWaiter(entry) {
+        const idx = this.waitQueue.indexOf(entry);
+        if (idx !== -1) {
+            this.waitQueue.splice(idx, 1);
+        }
+    }
+    removeSessionReferences(session) {
+        const availableIdx = this.available.indexOf(session);
+        if (availableIdx !== -1) {
+            this.available.splice(availableIdx, 1);
+        }
+        this.inUse.delete(session);
+    }
+    async removeAndClose(session) {
+        this.removeSessionReferences(session);
+        await this.closeSession(session);
+    }
+    scheduleTargetRetry(target) {
+        if (this.closed)
+            return;
+        setTimeout(() => {
+            if (this.closed)
+                return;
+            if (this.hasSessionForTarget(target.slotId) || this.getCreatingCount(target.slotId) > 0) {
+                return;
+            }
+            void this.addSession(target).catch(() => { });
+        }, 5_000);
+    }
+    collectMissingTargets() {
+        const occupied = new Set();
+        for (const session of this.available) {
+            occupied.add(session.targetSlotId);
+        }
+        for (const session of this.inUse) {
+            occupied.add(session.targetSlotId);
+        }
+        return this.targets.filter((target) => !occupied.has(target.slotId) && this.getCreatingCount(target.slotId) === 0);
+    }
+    pickMissingTarget() {
+        const missing = this.collectMissingTargets();
+        if (missing.length === 0)
+            return null;
+        const index = Math.floor(Date.now() % missing.length);
+        return missing[index] ?? missing[0] ?? null;
+    }
+    hasSessionForTarget(targetSlotId) {
+        return (this.available.some((session) => session.targetSlotId === targetSlotId) ||
+            [...this.inUse].some((session) => session.targetSlotId === targetSlotId));
+    }
+    incrementCreating(targetSlotId) {
+        this.creating++;
+        this.creatingByTarget.set(targetSlotId, this.getCreatingCount(targetSlotId) + 1);
+    }
+    decrementCreating(targetSlotId) {
+        this.creating = Math.max(0, this.creating - 1);
+        const next = this.getCreatingCount(targetSlotId) - 1;
+        if (next <= 0) {
+            this.creatingByTarget.delete(targetSlotId);
+        }
+        else {
+            this.creatingByTarget.set(targetSlotId, next);
+        }
+    }
+    getCreatingCount(targetSlotId) {
+        return this.creatingByTarget.get(targetSlotId) ?? 0;
+    }
+    buildTargetStats() {
+        const statsByTarget = new Map();
+        for (const [targetId, desired] of this.targetCounts.entries()) {
+            statsByTarget.set(targetId, {
+                targetId,
+                desired,
+                total: 0,
+                available: 0,
+                inUse: 0,
+                creating: 0,
+            });
+        }
+        for (const session of this.available) {
+            const target = statsByTarget.get(session.targetId);
+            if (!target)
+                continue;
+            target.total += 1;
+            target.available += 1;
+        }
+        for (const session of this.inUse) {
+            const target = statsByTarget.get(session.targetId);
+            if (!target)
+                continue;
+            target.total += 1;
+            target.inUse += 1;
+        }
+        for (const entry of this.targets) {
+            const target = statsByTarget.get(entry.targetId);
+            if (!target)
+                continue;
+            target.creating += this.getCreatingCount(entry.slotId);
+        }
+        return [...statsByTarget.values()];
+    }
+    async awaitSessionReady(session) {
+        if (session.cdpUrl) {
+            return session;
+        }
+        const started = Date.now();
+        while (Date.now() - started < this.sessionReadyTimeoutMs) {
+            await sleep(500);
+            let latest;
+            try {
+                latest = await this.withTimeout(this.sdk.browser.session.get({ sessionId: session.sessionId }), Math.min(this.healthCheckTimeoutMs, 4_000), `Session readiness timed out for ${session.sessionId}`);
+            }
+            catch {
+                continue;
+            }
+            if (latest.cdpUrl && (latest.status === "active" || latest.status === "starting")) {
+                return {
+                    sessionId: latest.sessionId,
+                    cdpUrl: latest.cdpUrl,
+                    servedBy: latest.servedBy,
+                    status: latest.status,
+                };
+            }
+            if (latest.status === "completed" || latest.status === "error") {
+                return null;
+            }
+        }
+        return null;
+    }
+    withTimeout(promise, timeoutMs, message) {
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+            promise
+                .then((value) => {
+                clearTimeout(timer);
+                resolve(value);
+            })
+                .catch((error) => {
+                clearTimeout(timer);
+                reject(error);
+            });
+        });
+    }
+}
+function expandTargets(config) {
+    const targets = config.targets;
+    if (targets && targets.length > 0) {
+        const explicitIds = new Set();
+        for (const [index, target] of targets.entries()) {
+            const id = target.id?.trim();
+            if (!id)
+                continue;
+            if (explicitIds.has(id)) {
+                throw new Error(`Pool target ID "${id}" is duplicated at index ${index}`);
+            }
+            explicitIds.add(id);
+        }
+        const expanded = targets.flatMap((target, index) => expandTarget(target, index));
+        if (typeof config.size === "number" && config.size !== expanded.length) {
+            throw new Error("PoolConfig.size must match the total count across PoolConfig.targets");
+        }
+        return expanded;
+    }
+    const size = config.size ?? 0;
+    if (!Number.isInteger(size) || size <= 0) {
+        throw new Error("PoolConfig.size must be a positive integer when targets are not provided");
+    }
+    return Array.from({ length: size }, (_, slotIndex) => ({
+        targetId: "default",
+        slotId: `default-slot-${slotIndex}`,
+        createOptions: {},
+    }));
+}
+function expandTarget(target, index) {
+    if (!Number.isInteger(target.count) || target.count <= 0) {
+        throw new Error(`Pool target at index ${index} must have a positive integer count`);
+    }
+    const targetId = target.id?.trim() || `target-${index}`;
+    const createOptions = buildCreateOptions(target);
+    return Array.from({ length: target.count }, (_, slotIndex) => ({
+        targetId,
+        slotId: `${targetId}-slot-${slotIndex}`,
+        createOptions,
+    }));
+}
+function buildCreateOptions(target) {
+    return {
+        ...(target.sessionOptions ?? {}),
+        ...(target.country ? { country: target.country } : {}),
+        ...(target.nodeId ? { nodeId: target.nodeId } : {}),
+        ...(target.type ? { type: target.type } : {}),
+    };
+}
+function buildTargetCountMap(targets) {
+    const counts = new Map();
+    for (const target of targets) {
+        counts.set(target.targetId, (counts.get(target.targetId) ?? 0) + 1);
+    }
+    return counts;
+}
+function normalizeIdleTimeout(value) {
+    if (value === null || value === undefined || value <= 0) {
+        return null;
+    }
+    return value;
+}
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
 }
 //# sourceMappingURL=pool.js.map
