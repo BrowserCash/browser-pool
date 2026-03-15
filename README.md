@@ -111,7 +111,7 @@ await pool.shutdown();
 ```
 
 There is also a dedicated example config file in
-[examples/browser-pool.config.mjs](/Users/alexspring/Desktop/Programming/Typescript/browser-pool/examples/browser-pool.config.mjs).
+[`examples/browser-pool.config.mjs`](./examples/browser-pool.config.mjs).
 
 If you just want the old behavior, `size` still works:
 
